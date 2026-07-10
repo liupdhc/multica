@@ -118,34 +118,36 @@ backup() {
 upgrade() {
     log "── 升级 ──"
 
-    # stash 本地修改（如果有）
+    # stash 本地已跟踪文件的修改（不包含 untracked 文件如 backups/）
     local stashed=false
-    if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]]; then
-        git -C "$REPO_DIR" stash push -m "auto-stash before upgrade ${TS}" 2>&1 | tee -a "$LOG_FILE"
-        stashed=true
-        log "已 stash 本地修改"
+    local changes
+    changes=$(git -C "$REPO_DIR" diff --name-only 2>/dev/null || true)
+    if [[ -n "$changes" ]]; then
+        if git -C "$REPO_DIR" stash push -m "auto-stash before upgrade ${TS}" 2>&1 | tee -a "$LOG_FILE"; then
+            stashed=true
+            log "已 stash 本地修改"
+        fi
     fi
 
-    # git pull
+    # git pull（拉最新代码）
     log "git pull..."
     if ! git -C "$REPO_DIR" pull --ff-only 2>&1 | tee -a "$LOG_FILE"; then
-        log_err "git pull 失败"
-        [[ "$stashed" == "true" ]] && git -C "$REPO_DIR" stash pop 2>/dev/null || true
-        return 1
+        log_warn "git pull 失败，继续使用本地代码执行 make selfhost"
     fi
 
     local new_sha
     new_sha=$(git -C "$REPO_DIR" rev-parse HEAD)
-    if [[ "$OLD_GIT_SHA" == "$new_sha" ]]; then
-        log "已是最新版本 (${new_sha:0:12})，无需升级"
-        return 1
+    if [[ "$OLD_GIT_SHA" != "$new_sha" ]]; then
+        log "代码更新: ${OLD_GIT_SHA:0:12} → ${new_sha:0:12}"
+    else
+        log "代码未变 (${new_sha:0:12})，仍执行 make selfhost 拉取最新镜像"
     fi
-    log "代码更新: ${OLD_GIT_SHA:0:12} → ${new_sha:0:12}"
 
-    # make selfhost（复用已有 .env，拉新镜像，重启服务）
+    # make selfhost（复用已有 .env，拉最新镜像，重启服务）
     log "make selfhost..."
     if ! make -C "$REPO_DIR" selfhost 2>&1 | tee -a "$LOG_FILE"; then
         log_err "make selfhost 失败"
+        [[ "$stashed" == "true" ]] && git -C "$REPO_DIR" stash pop 2>/dev/null || true
         return 1
     fi
 
@@ -276,13 +278,15 @@ cleanup() {
 # ── Cron ────────────────────────────────────────────────────────────────────
 
 install_cron() {
-    local cmd="${CRON_SCHEDULE} cd ${REPO_DIR} && bash scripts/upgrade.sh >> ${LOG_DIR}/cron.log 2>&1"
-    crontab -l 2>/dev/null | grep -vF "scripts/upgrade.sh" | { cat; echo "$cmd"; } | crontab -
+    local script_path
+    script_path=$(readlink -f "$0" 2>/dev/null || echo "$0")
+    local cmd="${CRON_SCHEDULE} cd ${REPO_DIR} && bash ${script_path} >> ${LOG_DIR}/cron.log 2>&1"
+    crontab -l 2>/dev/null | grep -vF "$(basename "$0")" | { cat; echo "$cmd"; } | crontab -
     log_ok "定时任务已安装: ${CRON_SCHEDULE}"
 }
 
 uninstall_cron() {
-    crontab -l 2>/dev/null | grep -vF "scripts/upgrade.sh" | crontab -
+    crontab -l 2>/dev/null | grep -vF "$(basename "$0")" | crontab -
     log_ok "定时任务已卸载"
 }
 
@@ -329,28 +333,21 @@ main() {
             exit 1
         fi
     else
-        # upgrade 返回 1 可能是"已是最新"或真正的失败
-        # 如果 git SHA 没变，说明是"已是最新"，不需要回滚
-        local current_sha
-        current_sha=$(git -C "$REPO_DIR" rev-parse HEAD 2>/dev/null || echo "")
-        if [[ "$current_sha" != "$OLD_GIT_SHA" ]]; then
-            log_err "升级过程出错，触发回滚..."
-            rollback
-        else
-            log "无需升级，流程结束"
-        fi
-        exit 0
+        log_err "升级过程出错，触发回滚..."
+        rollback
+        exit 1
     fi
 
     log "════════════════════════════════════════════════"
 }
 
-trap '{
-    local rc=$?
-    if [[ $rc -ne 0 && "$ROLLBACK_DONE" == "false" && -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
-        log_err "异常退出 (code=$rc)，触发回滚..."
+cleanup_on_exit() {
+    _rc=$?
+    if [[ $_rc -ne 0 && "$ROLLBACK_DONE" == "false" && -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
+        log_err "异常退出 (code=$_rc)，触发回滚..."
         rollback
     fi
-}' EXIT
+}
+trap cleanup_on_exit EXIT
 
 main "$@"
