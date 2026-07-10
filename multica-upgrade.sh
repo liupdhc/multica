@@ -15,7 +15,12 @@ set -euo pipefail
 # ── 配置 ────────────────────────────────────────────────────────────────────
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"        # 仓库根目录
+# 自动定位仓库根目录：脚本在根目录则直接用，在 scripts/ 子目录则上跳一级
+if [[ -f "${SCRIPT_DIR}/Makefile" && -f "${SCRIPT_DIR}/docker-compose.selfhost.yml" ]]; then
+    REPO_DIR="$SCRIPT_DIR"
+else
+    REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 BACKUP_ROOT="${REPO_DIR}/backups"
 LOG_DIR="${REPO_DIR}/logs"
 BACKUP_RETAIN_DAYS=7

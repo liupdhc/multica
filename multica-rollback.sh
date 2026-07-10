@@ -13,7 +13,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+if [[ -f "${SCRIPT_DIR}/Makefile" && -f "${SCRIPT_DIR}/docker-compose.selfhost.yml" ]]; then
+    REPO_DIR="$SCRIPT_DIR"
+else
+    REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 BACKUP_ROOT="${REPO_DIR}/backups"
 LOG_DIR="${REPO_DIR}/logs"
 HEALTH_TIMEOUT=90
