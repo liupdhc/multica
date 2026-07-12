@@ -406,9 +406,15 @@ rollback() {
 cleanup() {
     local count=0
     while IFS= read -r d; do
-        [[ -d "$d" && "$d" != "$BACKUP_DIR" ]] && { rm -rf "$d"; count=$((count + 1)); }
+        if [[ -d "$d" && "$d" != "$BACKUP_DIR" ]]; then
+            rm -rf "$d"
+            count=$((count + 1))
+            log "  已清理: $(basename "$d")"
+        fi
     done < <(find "$BACKUP_ROOT" -maxdepth 1 -mindepth 1 -type d -mtime "+${BACKUP_RETAIN_DAYS}" 2>/dev/null)
-    [[ $count -gt 0 ]] && log "清理了 ${count} 个旧备份"
+    if [[ $count -gt 0 ]]; then
+        log "清理了 ${count} 个旧备份"
+    fi
 }
 
 # ── Cron ────────────────────────────────────────────────────────────────────
