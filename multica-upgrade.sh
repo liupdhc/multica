@@ -64,11 +64,6 @@ preflight() {
     local avail_gb=$(( $(df -k "$REPO_DIR" | awk 'NR==2{print $4}') / 1024 / 1024 ))
     [[ $avail_gb -ge 5 ]] || die "磁盘空间不足: ${avail_gb}GB"
 
-    # 未提交的本地修改
-    if [[ -n "$(git -C "$REPO_DIR" status --porcelain 2>/dev/null)" ]]; then
-        log_warn "仓库有未提交的修改，升级前会自动 stash"
-    fi
-
     log_ok "预检通过 (磁盘 ${avail_gb}GB 可用)"
 }
 
@@ -125,38 +120,100 @@ backup() {
     log_ok "镜像 ID ($(cat "${BACKUP_DIR}/image-ids.env" | grep -c 'sha256' || echo 0) 个)"
 }
 
-# ── 拉取单个镜像（带超时 + 重试） ──────────────────────────────────────────
+# ── 拉取单个镜像（重试 + ghcr.io 代理回退） ────────────────────────────────
+
+# 执行 docker pull，输出同时写终端和日志文件
+_do_pull() {
+    local image="$1"
+    local pull_log
+    pull_log=$(mktemp)
+
+    # docker pull 输出同时写终端和临时文件
+    docker pull "$image" 2>&1 | tee "$pull_log"
+    local rc=${PIPESTATUS[0]}
+
+    # 检查是否是 "已是最新"
+    if grep -q "Image is up to date\|Already exists\|Downloaded newer image\|Pull complete" "$pull_log" 2>/dev/null; then
+        if [[ $rc -eq 0 ]]; then
+            rm -f "$pull_log"
+            return 0
+        fi
+    fi
+
+    # 失败时把 docker 实际错误记入日志
+    if [[ $rc -ne 0 ]]; then
+        local docker_err
+        docker_err=$(tail -3 "$pull_log" | tr '\n' ' ')
+        log "  docker 错误: ${docker_err}" >> "$LOG_FILE"
+    fi
+
+    rm -f "$pull_log"
+    return $rc
+}
+
+# ghcr.io 镜像走代理拉取，然后 tag 回原名
+_pull_via_mirror() {
+    local original="$1" mirror="$2"
+    local mirrored="${original/ghcr.io/$mirror}"
+    log "  尝试代理: ${mirror} ..."
+    if _do_pull "$mirrored"; then
+        docker tag "$mirrored" "$original" 2>/dev/null
+        docker rmi "$mirrored" 2>/dev/null || true
+        return 0
+    fi
+    return 1
+}
 
 pull_image() {
     local image="$1"
     local max_retry=3
-    local timeout_sec=300  # 单个镜像 5 分钟超时
 
     for attempt in $(seq 1 $max_retry); do
-        log "  拉取 ${image} (第 ${attempt}/${max_retry} 次, 超时 ${timeout_sec}s)..."
+        log "  拉取 ${image} (第 ${attempt}/${max_retry} 次)..."
 
-        # 用 timeout 命令包裹 docker pull，防止无限挂住
-        if timeout "$timeout_sec" docker pull "$image" 2>&1; then
-            log_ok "${image} 拉取成功"
+        # 直连
+        if _do_pull "$image"; then
+            log_ok "${image}"
             return 0
-        else
-            local rc=$?
-            if [[ $rc -eq 124 ]]; then
-                log_warn "拉取 ${image} 超时 (${timeout_sec}s)"
+        fi
+
+        log_warn "直连失败"
+
+        # ghcr.io 走代理
+        if [[ "$image" == ghcr.io/* ]]; then
+            local custom_mirror
+            custom_mirror=$(read_env GITHUB_MIRROR "")
+
+            if [[ -n "$custom_mirror" ]]; then
+                if _pull_via_mirror "$image" "$custom_mirror"; then
+                    log_ok "${image} (via ${custom_mirror})"
+                    return 0
+                fi
+                log_warn "代理 ${custom_mirror} 也失败"
             else
-                log_warn "拉取 ${image} 失败 (exit=$rc)"
+                local mirrors=("ghcr.dockerproxy.com" "ghcr.nju.edu.cn")
+                for m in "${mirrors[@]}"; do
+                    if _pull_via_mirror "$image" "$m"; then
+                        log_ok "${image} (via ${m})"
+                        echo "GITHUB_MIRROR=$m" >> "${REPO_DIR}/.env"
+                        log "  已将 ${m} 写入 .env"
+                        return 0
+                    fi
+                done
+                log_warn "所有代理均失败"
             fi
         fi
 
-        # 重试前等一会（递增等待）
+        # 重试等待（指数退避：30s, 60s, 120s）
         if [[ $attempt -lt $max_retry ]]; then
-            local wait=$((attempt * 15))
+            local wait=$(( 30 * (2 ** (attempt - 1)) ))
             log "  ${wait}s 后重试..."
             sleep "$wait"
         fi
     done
 
-    log_err "拉取 ${image} 失败，已重试 ${max_retry} 次"
+    log_err "拉取 ${image} 失败（直连 + 代理均不可用）"
+    log_err "  手动配置代理: 在 .env 中添加 GITHUB_MIRROR=你的镜像站地址"
     return 1
 }
 
@@ -165,15 +222,10 @@ pull_image() {
 upgrade() {
     log "── 升级 ──"
 
-    # stash 本地已跟踪文件的修改（不包含 untracked 文件如 backups/）
-    local stashed=false
-    local changes
-    changes=$(git -C "$REPO_DIR" diff --name-only 2>/dev/null || true)
-    if [[ -n "$changes" ]]; then
-        if git -C "$REPO_DIR" stash push -m "auto-stash before upgrade ${TS}" 2>&1 | tee -a "$LOG_FILE"; then
-            stashed=true
-            log "已 stash 本地修改"
-        fi
+    # 有本地修改时先 stash 保护，升级后不自动 pop（保留在 stash 列表中，需要时手动恢复）
+    if [[ -n "$(git -C "$REPO_DIR" diff --name-only 2>/dev/null || true)" ]]; then
+        git -C "$REPO_DIR" stash push -m "auto-stash before upgrade ${TS}" 2>&1 | tee -a "$LOG_FILE" || true
+        log "本地修改已 stash（升级后如需恢复: git stash pop）"
     fi
 
     # git pull（拉最新代码）
@@ -208,7 +260,6 @@ upgrade() {
     if [[ "$pull_failed" == "true" ]]; then
         log_err "应用镜像拉取失败，请检查网络或配置 Docker 镜像加速器"
         log_err "  可在 /etc/docker/daemon.json 中添加 registry-mirrors"
-        [[ "$stashed" == "true" ]] && git -C "$REPO_DIR" stash pop 2>/dev/null || true
         return 1
     fi
 
@@ -216,12 +267,8 @@ upgrade() {
     log "── 启动服务 ──"
     docker compose -f "${REPO_DIR}/docker-compose.selfhost.yml" up -d 2>&1 | tee -a "$LOG_FILE" || {
         log_err "docker compose up 失败"
-        [[ "$stashed" == "true" ]] && git -C "$REPO_DIR" stash pop 2>/dev/null || true
         return 1
     }
-
-    # 恢复 stash
-    [[ "$stashed" == "true" ]] && { git -C "$REPO_DIR" stash pop 2>/dev/null || log_warn "stash pop 失败，请手动处理"; }
 }
 
 # ── 健康检查 ─────────────────────────────────────────────────────────────────
@@ -327,9 +374,9 @@ rollback() {
         fe_tag=$(read_env MULTICA_WEB_IMAGE "ghcr.io/multica-ai/multica-web"):$(read_env MULTICA_IMAGE_TAG "latest")
         pg_tag="pgvector/pgvector:pg17"
 
-        [[ -n "$BACKEND_IMAGE_ID" ]]  && docker tag "$BACKEND_IMAGE_ID"  "$be_tag" 2>/dev/null || true
-        [[ -n "$FRONTEND_IMAGE_ID" ]] && docker tag "$FRONTEND_IMAGE_ID" "$fe_tag" 2>/dev/null || true
-        [[ -n "$POSTGRES_IMAGE_ID" ]] && docker tag "$POSTGRES_IMAGE_ID" "$pg_tag" 2>/dev/null || true
+        if [[ -n "$BACKEND_IMAGE_ID" ]];  then docker tag "$BACKEND_IMAGE_ID"  "$be_tag" 2>/dev/null || true; fi
+        if [[ -n "$FRONTEND_IMAGE_ID" ]]; then docker tag "$FRONTEND_IMAGE_ID" "$fe_tag" 2>/dev/null || true; fi
+        if [[ -n "$POSTGRES_IMAGE_ID" ]]; then docker tag "$POSTGRES_IMAGE_ID" "$pg_tag" 2>/dev/null || true; fi
         log_ok "已将旧镜像 ID 重新 tag 为 ${be_tag##*/} / ${fe_tag##*/}"
     fi
 
@@ -345,7 +392,11 @@ rollback() {
     git -C "$REPO_DIR" checkout "$branch" 2>/dev/null || true
 
     sleep 5
-    health_check && log_ok "回滚成功，服务已恢复正常" || log_err "回滚后健康检查未通过，请手动排查"
+    if health_check; then
+        log_ok "回滚成功，服务已恢复正常"
+    else
+        log_err "回滚后健康检查未通过，请手动排查"
+    fi
 
     log "备份保留在: ${BACKUP_DIR}"
 }
