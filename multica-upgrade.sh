@@ -111,6 +111,53 @@ backup() {
             alpine:latest cp -a /src/. /dst/ 2>>"$LOG_FILE"
         log_ok "uploads 卷"
     fi
+
+    # 保存当前运行的镜像 ID（回滚时需要精确恢复旧镜像）
+    local compose_file="${REPO_DIR}/docker-compose.selfhost.yml"
+    (
+        echo "BACKEND_IMAGE_ID=$(docker inspect --format='{{.Id}}' \
+            "$(docker compose -f "$compose_file" ps -q backend 2>/dev/null)" 2>/dev/null || echo "")"
+        echo "FRONTEND_IMAGE_ID=$(docker inspect --format='{{.Id}}' \
+            "$(docker compose -f "$compose_file" ps -q frontend 2>/dev/null)" 2>/dev/null || echo "")"
+        echo "POSTGRES_IMAGE_ID=$(docker inspect --format='{{.Id}}' \
+            "$(docker compose -f "$compose_file" ps -q postgres 2>/dev/null)" 2>/dev/null || echo "")"
+    ) > "${BACKUP_DIR}/image-ids.env"
+    log_ok "镜像 ID ($(cat "${BACKUP_DIR}/image-ids.env" | grep -c 'sha256' || echo 0) 个)"
+}
+
+# ── 拉取单个镜像（带超时 + 重试） ──────────────────────────────────────────
+
+pull_image() {
+    local image="$1"
+    local max_retry=3
+    local timeout_sec=300  # 单个镜像 5 分钟超时
+
+    for attempt in $(seq 1 $max_retry); do
+        log "  拉取 ${image} (第 ${attempt}/${max_retry} 次, 超时 ${timeout_sec}s)..."
+
+        # 用 timeout 命令包裹 docker pull，防止无限挂住
+        if timeout "$timeout_sec" docker pull "$image" 2>&1; then
+            log_ok "${image} 拉取成功"
+            return 0
+        else
+            local rc=$?
+            if [[ $rc -eq 124 ]]; then
+                log_warn "拉取 ${image} 超时 (${timeout_sec}s)"
+            else
+                log_warn "拉取 ${image} 失败 (exit=$rc)"
+            fi
+        fi
+
+        # 重试前等一会（递增等待）
+        if [[ $attempt -lt $max_retry ]]; then
+            local wait=$((attempt * 15))
+            log "  ${wait}s 后重试..."
+            sleep "$wait"
+        fi
+    done
+
+    log_err "拉取 ${image} 失败，已重试 ${max_retry} 次"
+    return 1
 }
 
 # ── 升级 ────────────────────────────────────────────────────────────────────
@@ -132,7 +179,7 @@ upgrade() {
     # git pull（拉最新代码）
     log "git pull..."
     if ! git -C "$REPO_DIR" pull --ff-only 2>&1 | tee -a "$LOG_FILE"; then
-        log_warn "git pull 失败，继续使用本地代码执行 make selfhost"
+        log_warn "git pull 失败，继续使用本地代码"
     fi
 
     local new_sha
@@ -140,16 +187,38 @@ upgrade() {
     if [[ "$OLD_GIT_SHA" != "$new_sha" ]]; then
         log "代码更新: ${OLD_GIT_SHA:0:12} → ${new_sha:0:12}"
     else
-        log "代码未变 (${new_sha:0:12})，仍执行 make selfhost 拉取最新镜像"
+        log "代码未变 (${new_sha:0:12})，继续拉取最新镜像"
     fi
 
-    # make selfhost（复用已有 .env，拉最新镜像，重启服务）
-    log "make selfhost..."
-    if ! make -C "$REPO_DIR" selfhost 2>&1 | tee -a "$LOG_FILE"; then
-        log_err "make selfhost 失败"
+    # 读取镜像名称
+    local be_img fe_img pg_img tag
+    be_img=$(read_env MULTICA_BACKEND_IMAGE "ghcr.io/multica-ai/multica-backend")
+    fe_img=$(read_env MULTICA_WEB_IMAGE "ghcr.io/multica-ai/multica-web")
+    pg_img="pgvector/pgvector:pg17"
+    tag=$(read_env MULTICA_IMAGE_TAG "latest")
+
+    # 逐个拉镜像（带超时 + 重试，阿里云到 ghcr.io 网络不稳定）
+    log "── 拉取镜像 ──"
+    local pull_failed=false
+    pull_image "${be_img}:${tag}" || pull_failed=true
+    pull_image "${fe_img}:${tag}" || pull_failed=true
+    # postgres 镜像一般不需要更新，但也拉一下确保最新
+    pull_image "${pg_img}"        || log_warn "postgres 镜像拉取失败，使用本地缓存"
+
+    if [[ "$pull_failed" == "true" ]]; then
+        log_err "应用镜像拉取失败，请检查网络或配置 Docker 镜像加速器"
+        log_err "  可在 /etc/docker/daemon.json 中添加 registry-mirrors"
         [[ "$stashed" == "true" ]] && git -C "$REPO_DIR" stash pop 2>/dev/null || true
         return 1
     fi
+
+    # 启动/重启服务（镜像已就绪，不再走 make selfhost 的 pull 步骤）
+    log "── 启动服务 ──"
+    docker compose -f "${REPO_DIR}/docker-compose.selfhost.yml" up -d 2>&1 | tee -a "$LOG_FILE" || {
+        log_err "docker compose up 失败"
+        [[ "$stashed" == "true" ]] && git -C "$REPO_DIR" stash pop 2>/dev/null || true
+        return 1
+    }
 
     # 恢复 stash
     [[ "$stashed" == "true" ]] && { git -C "$REPO_DIR" stash pop 2>/dev/null || log_warn "stash pop 失败，请手动处理"; }
@@ -246,10 +315,26 @@ rollback() {
         log_ok "uploads 已恢复"
     fi
 
-    # 用旧版本重新启动
-    log "make selfhost (旧版本)..."
-    make -C "$REPO_DIR" selfhost 2>&1 | tee -a "$LOG_FILE" || {
-        log_err "回滚后 make selfhost 失败，请手动排查"
+    # 用旧版本重新启动（不 pull，使用备份的旧镜像 ID）
+    log "用旧镜像重启服务..."
+    local compose_file="${REPO_DIR}/docker-compose.selfhost.yml"
+
+    # 将旧镜像 ID 重新 tag 为 compose 期望的名称，防止 pull 到新版本
+    if [[ -f "${BACKUP_DIR}/image-ids.env" ]]; then
+        source "${BACKUP_DIR}/image-ids.env"
+        local be_tag fe_tag pg_tag
+        be_tag=$(read_env MULTICA_BACKEND_IMAGE "ghcr.io/multica-ai/multica-backend"):$(read_env MULTICA_IMAGE_TAG "latest")
+        fe_tag=$(read_env MULTICA_WEB_IMAGE "ghcr.io/multica-ai/multica-web"):$(read_env MULTICA_IMAGE_TAG "latest")
+        pg_tag="pgvector/pgvector:pg17"
+
+        [[ -n "$BACKEND_IMAGE_ID" ]]  && docker tag "$BACKEND_IMAGE_ID"  "$be_tag" 2>/dev/null || true
+        [[ -n "$FRONTEND_IMAGE_ID" ]] && docker tag "$FRONTEND_IMAGE_ID" "$fe_tag" 2>/dev/null || true
+        [[ -n "$POSTGRES_IMAGE_ID" ]] && docker tag "$POSTGRES_IMAGE_ID" "$pg_tag" 2>/dev/null || true
+        log_ok "已将旧镜像 ID 重新 tag 为 ${be_tag##*/} / ${fe_tag##*/}"
+    fi
+
+    docker compose -f "$compose_file" up -d 2>&1 | tee -a "$LOG_FILE" || {
+        log_err "回滚后 docker compose up 失败，请手动排查"
         log_err "  备份目录: ${BACKUP_DIR}"
         return 1
     }

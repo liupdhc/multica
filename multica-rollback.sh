@@ -200,8 +200,21 @@ main() {
             restore_db "$bdir"
             restore_uploads "$bdir"
 
-            log "make selfhost..."
-            make -C "$REPO_DIR" selfhost 2>&1 | tee -a "$LOG_FILE" || die "make selfhost 失败"
+            # 将旧镜像 ID 重新 tag，防止 compose pull 拉到新版本
+            if [[ -f "${bdir}/image-ids.env" ]]; then
+                source "${bdir}/image-ids.env"
+                local be_tag fe_tag pg_tag
+                be_tag=$(read_env MULTICA_BACKEND_IMAGE "ghcr.io/multica-ai/multica-backend"):$(read_env MULTICA_IMAGE_TAG "latest")
+                fe_tag=$(read_env MULTICA_WEB_IMAGE "ghcr.io/multica-ai/multica-web"):$(read_env MULTICA_IMAGE_TAG "latest")
+                pg_tag="pgvector/pgvector:pg17"
+                [[ -n "$BACKEND_IMAGE_ID" ]]  && docker tag "$BACKEND_IMAGE_ID"  "$be_tag" 2>/dev/null || true
+                [[ -n "$FRONTEND_IMAGE_ID" ]] && docker tag "$FRONTEND_IMAGE_ID" "$fe_tag" 2>/dev/null || true
+                [[ -n "$POSTGRES_IMAGE_ID" ]] && docker tag "$POSTGRES_IMAGE_ID" "$pg_tag" 2>/dev/null || true
+                log_ok "已将旧镜像重新 tag"
+            fi
+
+            log "docker compose up -d (不 pull，使用本地旧镜像)..."
+            docker compose -f "${REPO_DIR}/docker-compose.selfhost.yml" up -d 2>&1 | tee -a "$LOG_FILE" || die "docker compose up 失败"
 
             # 切回分支
             local branch; branch=$(git -C "$REPO_DIR" symbolic-ref --short HEAD 2>/dev/null || echo "main")
