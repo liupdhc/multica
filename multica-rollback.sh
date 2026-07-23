@@ -207,9 +207,9 @@ main() {
                 be_tag=$(read_env MULTICA_BACKEND_IMAGE "ghcr.io/multica-ai/multica-backend"):$(read_env MULTICA_IMAGE_TAG "latest")
                 fe_tag=$(read_env MULTICA_WEB_IMAGE "ghcr.io/multica-ai/multica-web"):$(read_env MULTICA_IMAGE_TAG "latest")
                 pg_tag="pgvector/pgvector:pg17"
-                [[ -n "$BACKEND_IMAGE_ID" ]]  && docker tag "$BACKEND_IMAGE_ID"  "$be_tag" 2>/dev/null || true
-                [[ -n "$FRONTEND_IMAGE_ID" ]] && docker tag "$FRONTEND_IMAGE_ID" "$fe_tag" 2>/dev/null || true
-                [[ -n "$POSTGRES_IMAGE_ID" ]] && docker tag "$POSTGRES_IMAGE_ID" "$pg_tag" 2>/dev/null || true
+                if [[ -n "$BACKEND_IMAGE_ID" ]];  then docker tag "$BACKEND_IMAGE_ID"  "$be_tag" 2>/dev/null || true; fi
+                if [[ -n "$FRONTEND_IMAGE_ID" ]]; then docker tag "$FRONTEND_IMAGE_ID" "$fe_tag" 2>/dev/null || true; fi
+                if [[ -n "$POSTGRES_IMAGE_ID" ]]; then docker tag "$POSTGRES_IMAGE_ID" "$pg_tag" 2>/dev/null || true; fi
                 log_ok "已将旧镜像重新 tag"
             fi
 
