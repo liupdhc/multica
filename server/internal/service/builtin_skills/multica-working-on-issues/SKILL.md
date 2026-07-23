@@ -146,6 +146,32 @@ multica issue metadata delete <issue-id> --key <stale-key>
 `--value` is JSON-parsed by default (bool/number are sniffed); pass `--type
 string|number|bool` to force a type.
 
+## Custom properties: typed workflow state
+
+Workspaces may define custom issue properties (Severity, Environment, QA
+Status, ...). Properties are the typed, user-visible sibling of metadata:
+values are validated against the definition (select options, date format,
+http(s) URL), visible in the issue sidebar, and addressed by name.
+
+- Read what exists before writing: `multica property list` shows the catalog;
+  `multica issue property list <issue-id>` shows values set on the issue.
+- Set values by property name and option name — the CLI translates to ids:
+
+```bash
+multica issue property set <issue-id> --name Environment --value staging
+multica issue property set <issue-id> --name Platforms --value "iOS,Android"
+multica issue property unset <issue-id> --name Environment
+```
+
+- A validation error lists the legal options — fix the value and retry.
+- Definitions may include an optional catalog icon for visual identification;
+  it does not change the property's type or value validation.
+- Agents cannot create or edit property definitions (owner/admin humans only).
+  If a needed property does not exist, propose it in a comment instead.
+- Property vs metadata: if the value is workflow state a human should see and
+  filter by, and a definition exists, prefer the property. Metadata stays the
+  free-form scratchpad for run state (`pr_url`, `waiting_on`, ...).
+
 ## Status changes have server side effects
 
 A status change is not cosmetic — the server enqueues or skips agent work based
@@ -154,12 +180,25 @@ on it. These are the contracts, not advice:
 - **`backlog`** parks an agent-assigned issue: the assignee is set but no task
   fires. Moving `backlog → todo` (or any non-done/non-cancelled status) enqueues
   the assigned agent then.
+- **`in_progress` / `in_review` on assignment runs** are agent-managed CLI
+  mutations, not `StartTask` / `CompleteTask` side effects. The assignment
+  runtime brief asks ordinary agents for `todo`/`backlog` → `in_progress` then
+  `in_review` when they have delivered. Squad leaders share the opening
+  `in_progress` step on the first assignment turn, keep the parent there while
+  members work, and only move to `in_review` when a later re-trigger confirms
+  the overall goal is met.
 - **`in_review`** is an accepted issue status. Some workflows use it while a PR
   is open and awaiting review; moving to it is an explicit mutation.
 - **`done`** on a child issue posts a system comment on its parent. If a PR
   carries close intent (`Closes MUL-XXXX`), it advances the issue to `done`
   itself on merge — you do not also need to flip it manually.
-- **`cancelled`** stops outstanding work; treat it as a user-driven decision.
+- **`cancelled`** is a terminal, user-driven decision to close the issue. Like
+  `done` it enqueues no new agent work, but it does **not** stop tasks already in
+  flight — a run in progress keeps going (MUL-4465). To stop a running task,
+  cancel the task itself.
+- **Failed issue-triggered tasks** may roll an issue from `in_progress` back to
+  `todo` when no active task / retry remains — that is the main server-owned
+  status write on the agent-run path.
 
 ## Sub-issues: `todo` starts work now, `backlog` parks it
 

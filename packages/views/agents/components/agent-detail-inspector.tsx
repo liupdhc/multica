@@ -24,6 +24,7 @@ import { ResourceLabelPicker } from "../../labels/resource-label-picker";
 import { ModelPicker } from "./inspector/model-picker";
 import { RuntimePicker } from "./inspector/runtime-picker";
 import { ThinkingSettingField } from "./inspector/thinking-prop-row";
+import { ServiceTierSettingField } from "./inspector/service-tier-setting-field";
 
 interface InspectorProps {
   agent: Agent;
@@ -125,7 +126,7 @@ export function AgentDetailInspector({
           <SettingsRow
             label={t(($) => $.inspector.avatar_label)}
             description={t(($) => $.inspector.avatar_hint)}
-            controlClassName="sm:max-w-none"
+            size="none"
           >
             <div className="flex justify-start sm:justify-end">
               <AvatarUploadControl
@@ -141,7 +142,7 @@ export function AgentDetailInspector({
 
           <SettingsRow
             label={t(($) => $.inspector.name_label)}
-            controlClassName="sm:w-80"
+            size="text"
           >
             <div>
               <Input
@@ -165,7 +166,7 @@ export function AgentDetailInspector({
 
           <SettingsRow
             label={t(($) => $.inspector.description_label)}
-            controlClassName="sm:w-96"
+            size="text"
             align="start"
           >
             <div>
@@ -191,7 +192,7 @@ export function AgentDetailInspector({
           <SettingsRow
             label={t(($) => $.inspector.labels_label)}
             description={t(($) => $.inspector.labels_hint)}
-            controlClassName="sm:w-96"
+            size="text"
             align="start"
           >
             <ResourceLabelPicker
@@ -210,7 +211,7 @@ export function AgentDetailInspector({
         <SettingsCard>
           <SettingsRow
             label={t(($) => $.inspector.prop_runtime)}
-            controlClassName="sm:w-80"
+            size="select-wide"
           >
             <RuntimePicker
               variant="field"
@@ -220,12 +221,22 @@ export function AgentDetailInspector({
               members={members}
               currentUserId={currentUserId}
               canEdit={canEdit}
-              onChange={(id) => update({ runtime_id: id })}
+              // Model, thinking level, and service tier are runtime/model
+              // native. Clear them together so the new runtime resolves its
+              // own defaults instead of inheriting incompatible tokens.
+              onChange={(id) =>
+                update({
+                  runtime_id: id,
+                  model: "",
+                  thinking_level: "",
+                  service_tier: "",
+                })
+              }
             />
           </SettingsRow>
           <SettingsRow
             label={t(($) => $.inspector.prop_model)}
-            controlClassName="sm:w-80"
+            size="select-wide"
           >
             <ModelPicker
               variant="field"
@@ -249,9 +260,18 @@ export function AgentDetailInspector({
               update({ thinking_level: thinkingLevel })
             }
           />
+          <ServiceTierSettingField
+            label={t(($) => $.inspector.prop_speed)}
+            runtimeId={agent.runtime_id}
+            runtimeOnline={!!isOnline}
+            model={agent.model ?? ""}
+            value={agent.service_tier ?? ""}
+            canEdit={canEdit}
+            onChange={(serviceTier) => update({ service_tier: serviceTier })}
+          />
           <SettingsRow
             label={t(($) => $.inspector.prop_concurrency)}
-            controlClassName="sm:w-80"
+            size="select-wide"
           >
             <ConcurrencyField
               value={agent.max_concurrent_tasks}
